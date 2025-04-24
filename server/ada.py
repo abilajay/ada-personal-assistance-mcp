@@ -1,21 +1,16 @@
 # server/ada.py (Revised: Emits moved into functions)
 import base64
 import torch
-import python_weather
 from google.genai import types
 import asyncio
-from google import genai 
-import googlemaps
-from datetime import datetime 
+from google import genai
 import os
 from dotenv import load_dotenv
 import websockets
 import json
-from googlesearch import search as Google_Search_sync
-import aiohttp # For HTTP requests
-from bs4 import BeautifulSoup # For HTML parsing
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from custom_tools import get_weather, get_travel_duration, get_search_results
 
 load_dotenv()
 
@@ -185,6 +180,13 @@ class ADA:
         Any Image that is sent with the prompt is being sent from a live video feed from a webcamera.
 
         Always utilize the most appropriate tools to help users effectively.
+        
+        IMPORTANT: When using tools, follow these guidelines:
+        1. ALWAYS respond with an error message if you can't execute a tool - never go silent
+        2. If you can't properly extract parameters (like locations, search terms), tell the user specifically what was unclear
+        3. For weather queries with complex locations (like "Theni, Tamilnadu"), make sure to include the full location string 
+        4. If a tool execution fails, explain what happened and suggest alternatives if possible
+        5. Never leave the user waiting without feedback - always provide some response
         """
 
         # Initialize config and chat (will be updated after MCP setup)
@@ -268,237 +270,24 @@ class ADA:
             raise
 
     async def get_weather(self, location: str) -> dict | None:
-        """ Fetches current weather and emits update via SocketIO. """
-        async with python_weather.Client(unit=python_weather.IMPERIAL) as client:
-            try:
-                weather = await client.get(location)
-                weather_data = {
-                    'location': location,
-                    'current_temp_f': weather.temperature,
-                    'precipitation': weather.precipitation, # Added precipitation
-                    'description': weather.description,
-                }
-                print(f"Weather data fetched: {weather_data}")
-
-                # --- Emit weather_update from here ---
-                if self.socketio and self.client_sid:
-                    print(f"--- Emitting weather_update event for SID: {self.client_sid} ---")
-                    self.socketio.emit('weather_update', weather_data, room=self.client_sid)
-                # --- End Emit ---
-
-                return weather_data # Still return data for Gemini
-
-            except Exception as e:
-                print(f"Error fetching weather for {location}: {e}")
-                return {"error": f"Could not fetch weather for {location}."} # Return error info
-
-    def _sync_get_travel_duration(self, origin: str, destination: str, mode: str = "driving") -> str:
-         if not self.Maps_api_key or self.Maps_api_key == "YOUR_PROVIDED_KEY": # Check the actual key
-            print("Error: Google Maps API Key is missing or invalid.")
-            return "Error: Missing or invalid Google Maps API Key configuration."
-         try:
-            gmaps = googlemaps.Client(key=self.Maps_api_key)
-            now = datetime.now()
-            print(f"Requesting directions: From='{origin}', To='{destination}', Mode='{mode}'")
-            directions_result = gmaps.directions(origin, destination, mode=mode, departure_time=now)
-            if directions_result:
-                leg = directions_result[0]['legs'][0]
-                duration_text = "Not available"
-                if mode == "driving" and 'duration_in_traffic' in leg:
-                    duration_text = leg['duration_in_traffic']['text']
-                    result = f"Estimated travel duration ({mode}, with current traffic): {duration_text}"
-                elif 'duration' in leg:
-                     duration_text = leg['duration']['text']
-                     result = f"Estimated travel duration ({mode}): {duration_text}"
-                else:
-                    result = f"Duration information not found in response for {mode}."
-                print(f"Directions Result: {result}")
-                return result
-            else:
-                print(f"No route found from {origin} to {destination} via {mode}.")
-                return f"Could not find a route from {origin} to {destination} via {mode}."
-         except Exception as e:
-            print(f"An unexpected error occurred during travel duration lookup: {e}")
-            return f"An unexpected error occurred: {e}"
+        """ Wrapper for the custom_tools.get_weather function """
+        return await get_weather(location, api_key=None, socketio=self.socketio, client_sid=self.client_sid)
 
     async def get_travel_duration(self, origin: str, destination: str, mode: str = "driving") -> dict:
-        """ Async wrapper to get travel duration and emit map update via SocketIO. """
-        print(f"Received request for travel duration from: {origin} to: {destination}, Mode: {mode}")
-        if not mode:
-            mode = "driving"
-
-        try:
-            result_string = await asyncio.to_thread(
-                self._sync_get_travel_duration, origin, destination, mode
-            )
-
-            # --- Emit map_update from here ---
-            if self.socketio and self.client_sid and not result_string.startswith("Error"): # Only emit if successful
-                map_payload = {
-                    'destination': destination,
-                    'origin': origin
-                }
-                print(f"--- Emitting map_update event for SID: {self.client_sid} ---")
-                self.socketio.emit('map_update', map_payload, room=self.client_sid)
-            # --- End Emit ---
-
-            return {"duration_result": result_string} # Still return result for Gemini
-
-        except Exception as e:
-            print(f"Error calling _sync_get_travel_duration via to_thread: {e}")
-            return {"duration_result": f"Failed to execute travel duration request: {e}"}
-
-    async def _fetch_and_extract_snippet(self, session, url: str) -> dict | None:
-        """
-        Fetches HTML from a URL, extracts title, meta description,
-        and concatenates text from paragraph tags.
-        Returns a dictionary or None on failure.
-        """
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        title = "No Title Found"
-        snippet = "No Description Found"
-        page_text_summary = "Could not extract page text." # Default value
-
-        try:
-            async with session.get(url, headers=headers, timeout=15, ssl=False) as response: # Increased timeout slightly
-                if response.status == 200:
-                    html_content = await response.text()
-                    soup = BeautifulSoup(html_content, 'lxml')
-
-                    # --- Extract Title (as before) ---
-                    title_tag = soup.find('title')
-                    if title_tag and title_tag.string:
-                        title = title_tag.string.strip()
-
-                    # --- Extract Meta Description (as before) ---
-                    description_tag = soup.find('meta', attrs={'name': 'description'})
-                    if description_tag and description_tag.get('content'):
-                        snippet = description_tag['content'].strip()
-
-                    # --- NEW: Extract Text from Paragraphs ---
-                    try:
-                        paragraphs = soup.find_all('p') # Find all <p> tags
-                        # Join the text content of all paragraphs, stripping whitespace
-                        full_page_text = ' '.join(p.get_text(strip=True) for p in paragraphs if p.get_text(strip=True))
-
-                        # Basic Processing/Summarization (CRUCIAL for large text)
-                        # Option 1: Simple Truncation
-                        max_len = 1500 # Limit the amount of text returned
-                        if len(full_page_text) > max_len:
-                             page_text_summary = full_page_text[:max_len] + "..."
-                        else:
-                             page_text_summary = full_page_text
-
-                        # Option 2 (More Advanced - Requires ML library like transformers):
-                        # Implement summarization logic here if needed.
-
-                        if not page_text_summary: # Handle case where no paragraph text was found
-                             page_text_summary = "No paragraph text found on page."
-
-                    except Exception as text_ex:
-                        print(f"  Error extracting paragraph text from {url}: {text_ex}")
-                        # Keep default "Could not extract..." message
-
-                    print(f"  Extracted: Title='{title}', Snippet='{snippet[:50]}...', Text='{page_text_summary[:50]}...' from {url}")
-                    # --- Return enriched dictionary ---
-                    return {
-                        "url": url,
-                        "title": title,
-                        "meta_snippet": snippet, # Renamed for clarity
-                        "page_content_summary": page_text_summary # Added page text
-                    }
-                else:
-                    print(f"  Failed to fetch {url}: Status {response.status}")
-                    return None # Return None on non-200 status
-
-        # --- Keep existing error handling ---
-        except asyncio.TimeoutError:
-            print(f"  Timeout fetching {url}")
-        except aiohttp.ClientError as e:
-            print(f"  ClientError fetching {url}: {e}")
-        except Exception as e:
-            print(f"  Error processing {url}: {e}")
-
-        # Return None if any exception occurred before successful extraction
-        return None
-    
-    def _sync_Google_Search(self, query: str, num_results: int = 5) -> list:
-        # ... (keep the previous working version that returns URLs) ...
-        print(f"Performing synchronous Google search for: '{query}'")
-        try:
-            results = list(Google_Search_sync(term=query, num_results=num_results, lang="en", timeout=1))
-            print(f"Found {len(results)} results.")
-            return results
-        except Exception as e:
-            print(f"Error during Google search for '{query}': {e}")
-            return []
-
-# Inside the ADA class in server/ada.py
+        """ Wrapper for the custom_tools.get_travel_duration function """
+        return await get_travel_duration(
+            origin, 
+            destination, 
+            mode, 
+            maps_api_key=self.Maps_api_key, 
+            socketio=self.socketio, 
+            client_sid=self.client_sid
+        )
 
     async def get_search_results(self, query: str) -> dict:
-        """
-        Async wrapper for Google search. Fetches URLs, then retrieves
-        title, meta snippet, and a summary of page paragraph text for each.
-        Emits results via SocketIO.
-        Returns a dictionary containing a list of result objects.
-        """
-        print(f"Received request for Google search with page content fetch: '{query}'")
-        fetched_results = [] # This will store dicts: {"url":..., "title":..., "meta_snippet":..., "page_content_summary":...}
-        try:
-            # Step 1: Get URLs (no change)
-            search_urls = await asyncio.to_thread(
-                self._sync_Google_Search, query, num_results=5
-            )
-            if not search_urls:
-                print("No URLs found by Google Search.")
-                # --- EMIT EMPTY RESULTS TO FRONTEND ---
-                if self.socketio and self.client_sid:
-                    print(f"--- Emitting empty search_results_update event for SID: {self.client_sid} ---")
-                    self.socketio.emit('search_results_update', {"results": [], "query": query}, room=self.client_sid)
-                # --- END EMIT ---
-                return {"results": []} # Return for Gemini
+        """ Wrapper for the custom_tools.get_search_results function """
+        return await get_search_results(query, socketio=self.socketio, client_sid=self.client_sid)
 
-            # Step 2: Fetch content concurrently (no change in logic)
-            print(f"Fetching content for {len(search_urls)} URLs...")
-            async with aiohttp.ClientSession() as session:
-                tasks = [self._fetch_and_extract_snippet(session, url) for url in search_urls]
-                results_from_gather = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Step 3: Process results (filter Nones and Exceptions)
-            for result in results_from_gather:
-                if isinstance(result, dict): # Successfully fetched data
-                    fetched_results.append(result)
-                elif isinstance(result, Exception):
-                    print(f"   An error occurred during content fetching task: {result}")
-                # else: result is None (fetch/parse failed, already logged in helper)
-
-            print(f"Finished fetching content. Got {len(fetched_results)} results.")
-
-            # --- **** NEW: EMIT RESULTS TO FRONTEND **** ---
-            if self.socketio and self.client_sid:
-                 print(f"--- Emitting search_results_update event with {len(fetched_results)} results for SID: {self.client_sid} ---")
-                 # Send the query along with the results for context
-                 emit_payload = {"query": query, "results": fetched_results}
-                 self.socketio.emit('search_results_update', emit_payload, room=self.client_sid)
-            # --- **** END EMIT **** ---
-
-
-        except Exception as e:
-            print(f"Error running get_search_results for '{query}': {e}")
-            # Optionally emit an error event to the frontend here as well
-            if self.socketio and self.client_sid:
-                 self.socketio.emit('search_results_error', {"query": query, "error": str(e)}, room=self.client_sid)
-            return {"error": f"Failed to execute Google search with page content: {str(e)}"} # Return for Gemini
-
-        # Format the final result for Gemini (no change here)
-        response_payload = {
-            "results": fetched_results
-        }
-        print(f"Custom Google search function for '{query}' returning {len(fetched_results)} processed results to Gemini.")
-        return response_payload
-    
     async def clear_queues(self, text=""):
         queues_to_clear = [self.response_queue, self.audio_output_queue]
         # Add self.video_frame_queue back if using streaming logic
@@ -552,7 +341,21 @@ class ADA:
                 continue_conversation = True
                 while continue_conversation:
                     try:
-                        response_stream = await self.chat.send_message_stream(current_parts)
+                        # Set a timeout for the entire streaming process
+                        response_stream = await asyncio.wait_for(
+                            self.chat.send_message_stream(current_parts),
+                            timeout=15  # 15 seconds timeout for the entire streaming process
+                        )
+                    except asyncio.TimeoutError:
+                        print("❌ Timeout: Gemini response stream timed out after 15 seconds")
+                        error_msg = "I'm sorry, but I encountered a timeout while processing your request. If you were asking about weather or another tool function, please try again with a more specific location format, such as 'Weather in Theni, Tamil Nadu, India'."
+                        if self.socketio and self.client_sid:
+                            self.socketio.emit('receive_text_chunk', {'text': error_msg}, room=self.client_sid)
+                        if ENABLE_TTS:
+                            await self.response_queue.put(error_msg)
+                            await self.response_queue.put(None)
+                        self.input_queue.task_done()
+                        continue
                     except Exception as e:
                         print(f"❌ Gemini error: {e}")
                         raise
@@ -566,17 +369,33 @@ class ADA:
 
                         for part in chunk.candidates[0].content.parts:
                             if part.function_call:
+                                print(f"📣 Function call detected: {part.function_call.name} with args: {dict(part.function_call.args)}")
                                 collected_function_calls.append(part.function_call)
                             elif part.text:
-                                # Only print first 50 chars of response
-                                if not current_text_response:  # Only for first text chunk
-                                    print(f"💬 Response: {part.text[:50]}...")
+                                # Add text to response collection
                                 current_text_response.append(part.text)
+                                
+                                # Log the text chunk - with better formatting
+                                if len(current_text_response) == 1:  # First text chunk
+                                    print(f"💬 First response chunk: {part.text}")
+                                else:
+                                    # Log additional chunks with a simpler format
+                                    print(f"  + Additional chunk ({len(current_text_response)}): {part.text[:30]}..." if len(part.text) > 30 else f"  + Additional chunk ({len(current_text_response)}): {part.text}")
+                                
+                                # Process the text for TTS and UI
                                 if ENABLE_TTS:
                                     await self.response_queue.put(part.text)
                                 if self.socketio and self.client_sid:
                                     self.socketio.emit('receive_text_chunk', {'text': part.text}, room=self.client_sid)
 
+                    # More detailed logging after streaming completes
+                    print(f"📊 Stream complete: Received {len(current_text_response)} text chunks and {len(collected_function_calls)} function calls")
+                    
+                    # Print complete text response for easier debugging
+                    if current_text_response:
+                        full_response = ''.join(current_text_response)
+                        print(f"📝 Complete response text:\n{full_response}\n")
+                    
                     # Handle function calls if present
                     if collected_function_calls:
                         print(f"\n🔧 Executing {len(collected_function_calls)} tool(s)")
